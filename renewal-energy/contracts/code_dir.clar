@@ -9,17 +9,20 @@
 (define-constant ERR-INVALID-PARAMETER (err u5))
 (define-constant ERR-INSUFFICIENT-CAPACITY (err u6))
 (define-constant ERR-INSTALLATION-EXISTS (err u7))
+(define-constant ERR-ALREADY-CERTIFIED (err u8))
 (define-constant ERR-NOT-AUTHORIZED (err u9))
 (define-constant ERR-PRODUCTION-NOT-FOUND (err u10))
 (define-constant MAX-INSTALLATION-ID u1000) ;; Maximum allowed installation ID
 (define-constant MIN-CAPACITY-REQUIRED u10) ;; Minimum capacity to register
 (define-constant MAX-CAPACITY-INPUT u1000000) ;; Maximum capacity input allowed
+(define-constant MAX-VALIDATION-THRESHOLD u100) ;; Maximum validation threshold (100%)
 
 ;; Data Variables
 (define-data-var network-operator principal tx-sender)
 (define-data-var grid-operational bool false)
 (define-data-var production-period uint u0)
 (define-data-var minimum-capacity-threshold uint u100) ;; 100 capacity units minimum
+(define-data-var certification-threshold uint u66) ;; 66% approval required for certification
 
 ;; Energy Installation Structure
 (define-map energy-installations
@@ -31,7 +34,8 @@
         energy-type: (string-utf8 64),
         accepting-production: bool,
         developer: principal,
-        total-capacity: uint        ;; Sum of capacity of all engineers
+        total-capacity: uint,        ;; Sum of capacity of all engineers
+        certified-production: uint    ;; Counter of accepted production reports
     }
 )
 
@@ -49,7 +53,8 @@
     {
         capacity: uint,
         installations-developed: (list 30 uint),
-        production-reported: (list 30 uint)
+        production-reported: (list 30 uint),
+        certification-weight: uint    ;; Derived from capacity but can be modified
     }
 )
 
@@ -61,7 +66,27 @@
         metrics-hash: (buff 32),
         engineer: principal,
         target-installation: uint,
-        submitted-in-period: uint
+        submitted-in-period: uint,
+        certified: bool
+    }
+)
+
+;; Production Certifications
+(define-map production-certifications
+    {report-id: uint, certifier: principal}
+    {
+        validated: bool,
+        weight: uint
+    }
+)
+
+;; Certification Tallies for Production Reports
+(define-map certification-tallies
+    uint  ;; report-id
+    {
+        validation-weight: uint,
+        rejection-weight: uint,
+        total-certifications: uint
     }
 )
 
@@ -127,7 +152,8 @@
                 energy-type: energy-type,
                 accepting-production: true,
                 developer: tx-sender,
-                total-capacity: (get capacity engineer-profile)
+                total-capacity: (get capacity engineer-profile),
+                certified-production: u0
             })
         
         ;; Record engineer as developer
@@ -161,7 +187,8 @@
             {
                 capacity: initial-capacity,
                 installations-developed: (list),
-                production-reported: (list)
+                production-reported: (list),
+                certification-weight: initial-capacity
             })
             
         (ok true)))
@@ -183,6 +210,9 @@
         ;; Check if installation is accepting production reports
         (asserts! (get accepting-production installation) ERR-INSTALLATION-LOCKED)
         
+        ;; Check that report ID doesn't already exist
+        (asserts! (is-none (map-get? production-reports report-id)) ERR-INVALID-PARAMETER)
+        
         ;; Validate description and hash
         (asserts! (is-valid-description description) ERR-INVALID-PARAMETER)
         (asserts! (is-valid-hash metrics-hash) ERR-INVALID-PARAMETER)
@@ -194,7 +224,16 @@
                 metrics-hash: metrics-hash,
                 engineer: tx-sender,
                 target-installation: target-installation-id,
-                submitted-in-period: (var-get production-period)
+                submitted-in-period: (var-get production-period),
+                certified: false
+            })
+        
+        ;; Initialize certification tally
+        (map-set certification-tallies report-id
+            {
+                validation-weight: u0,
+                rejection-weight: u0,
+                total-certifications: u0
             })
         
         ;; Update engineer's reported production
@@ -203,6 +242,49 @@
                 production-reported: (unwrap! (as-max-len? 
                     (append (get production-reported engineer) report-id) u30)
                     ERR-INVALID-PARAMETER)
+            }))
+        
+        (ok true)))
+
+;; Certify Production Report
+(define-public (certify-production
+    (report-id uint)
+    (validate bool))
+    (let (
+        (report (unwrap! (map-get? production-reports report-id) ERR-PRODUCTION-NOT-FOUND))
+        (engineer (unwrap! (map-get? engineer-profiles tx-sender) ERR-INSUFFICIENT-CAPACITY))
+        (certification-tally (unwrap! (map-get? certification-tallies report-id) ERR-PRODUCTION-NOT-FOUND))
+        )
+        
+        ;; Check grid status
+        (asserts! (var-get grid-operational) ERR-GRID-OFFLINE)
+        
+        ;; Ensure report hasn't already been certified
+        (asserts! (not (get certified report)) ERR-INSTALLATION-LOCKED)
+        
+        ;; Check engineer hasn't already certified
+        (asserts! (is-none (map-get? production-certifications 
+                                    {report-id: report-id, certifier: tx-sender})) 
+                ERR-ALREADY-CERTIFIED)
+        
+        ;; Record the certification
+        (map-set production-certifications 
+            {report-id: report-id, certifier: tx-sender}
+            {
+                validated: validate,
+                weight: (get certification-weight engineer)
+            })
+        
+        ;; Update certification tally
+        (map-set certification-tallies report-id
+            (merge certification-tally {
+                validation-weight: (if validate 
+                                    (+ (get validation-weight certification-tally) (get certification-weight engineer))
+                                    (get validation-weight certification-tally)),
+                rejection-weight: (if (not validate)
+                                    (+ (get rejection-weight certification-tally) (get certification-weight engineer))
+                                    (get rejection-weight certification-tally)),
+                total-certifications: (+ (get total-certifications certification-tally) u1)
             }))
         
         (ok true)))
@@ -218,6 +300,65 @@
         (var-set production-period (+ (var-get production-period) u1))
         
         (ok true)))
+
+;; Process Specific Production Report
+(define-public (process-production-report (report-id uint))
+    (let (
+        (report (unwrap! (map-get? production-reports report-id) ERR-PRODUCTION-NOT-FOUND))
+        (certification-tally (unwrap! (map-get? certification-tallies report-id) ERR-PRODUCTION-NOT-FOUND))
+        (installation (unwrap! (map-get? energy-installations (get target-installation report)) ERR-INVALID-INSTALLATION))
+        (engineer (unwrap! (map-get? engineer-profiles (get engineer report)) ERR-INVALID-PARAMETER))
+        )
+        
+        ;; Only network operator can process production reports
+        (asserts! (is-network-operator) ERR-NOT-AUTHORIZED)
+        (asserts! (var-get grid-operational) ERR-GRID-OFFLINE)
+        
+        ;; Ensure report hasn't already been certified
+        (asserts! (not (get certified report)) ERR-INSTALLATION-LOCKED)
+        
+        ;; Check for sufficient certifications and meeting threshold
+        (if (and 
+                (> (+ (get validation-weight certification-tally) (get rejection-weight certification-tally)) u0)
+                (>= (* (get validation-weight certification-tally) u100) 
+                    (* (+ (get validation-weight certification-tally) (get rejection-weight certification-tally)) (var-get certification-threshold)))
+            )
+            (begin
+                ;; Update report status
+                (map-set production-reports report-id
+                    (merge report {certified: true}))
+                
+                ;; Update installation data
+                (map-set energy-installations (get target-installation report)
+                    (merge installation {
+                        technical-hash: (get metrics-hash report),
+                        certified-production: (+ (get certified-production installation) u1)
+                    }))
+                
+                ;; Add engineer to installation engineers if not already
+                (match (map-get? installation-engineers {installation-id: (get target-installation report), engineer: (get engineer report)})
+                    existing-commitment
+                    true
+                    ;; Add new engineer
+                    (map-set installation-engineers 
+                        {installation-id: (get target-installation report), engineer: (get engineer report)}
+                        {capacity-committed: (get capacity engineer)}))
+                
+                ;; Update installation's total capacity
+                (map-set energy-installations (get target-installation report)
+                    (merge installation {
+                        total-capacity: (+ (get total-capacity installation) (get capacity engineer))
+                    }))
+                
+                ;; Reward engineer with capacity boost
+                (map-set engineer-profiles (get engineer report)
+                    (merge engineer {
+                        capacity: (+ (get capacity engineer) u25),
+                        certification-weight: (+ (get certification-weight engineer) u10)
+                    }))
+                
+                (ok true))
+            (ok false)))) ;; No action if threshold not met
 
 ;; Change Installation Production Status
 (define-public (set-installation-production-status (installation-id uint) (open bool))
@@ -247,11 +388,15 @@
 (define-read-only (get-production-report-details (report-id uint))
     (map-get? production-reports report-id))
 
+(define-read-only (get-production-certifications (report-id uint))
+    (map-get? certification-tallies report-id))
+
 (define-read-only (get-grid-metrics)
     {
         operational: (var-get grid-operational),
         production-period: (var-get production-period),
-        minimum-capacity: (var-get minimum-capacity-threshold)
+        minimum-capacity: (var-get minimum-capacity-threshold),
+        certification-threshold: (var-get certification-threshold)
     })
 
 (define-public (update-minimum-capacity (new-minimum uint))
@@ -260,6 +405,14 @@
         ;; Validate new threshold is within acceptable range
         (asserts! (and (>= new-minimum MIN-CAPACITY-REQUIRED) (<= new-minimum MAX-CAPACITY-INPUT)) ERR-INVALID-PARAMETER)
         (var-set minimum-capacity-threshold new-minimum)
+        (ok true)))
+
+(define-public (update-certification-threshold (new-percentage uint))
+    (begin
+        (asserts! (is-network-operator) ERR-NOT-NETWORK-OPERATOR)
+        ;; Validate percentage is between 1 and 100
+        (asserts! (and (> new-percentage u0) (<= new-percentage MAX-VALIDATION-THRESHOLD)) ERR-INVALID-PARAMETER)
+        (var-set certification-threshold new-percentage)
         (ok true)))
 
 (define-public (deactivate-grid)
